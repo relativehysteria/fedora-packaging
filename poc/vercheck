@@ -32,6 +32,14 @@ HTTP_TIMEOUT = 20
 # The user agent to use for all requests.
 USER_AGENT = "check-package-versions/3.0"
 
+# The API endpoint used for listing out tracking fedora projects.
+API_PROJECTS = "https://src.fedoraproject.org/api/0/projects"
+
+# The API endpoint used for listing out package versions across branches.
+# NOTE: Information retrieved from this endpoint is stale at times
+API_DASHBOARD = "https://packager-dashboard.fedoraproject.org/" \
+    "api/v1/package_versions/{}"
+
 
 # TYPE ALIASES AND DATA CLASSES ────────────────────────────────────────────────
 
@@ -129,7 +137,6 @@ def fetch_packages(user: str, jobs: int = 1) -> list[str]:
         raise ValueError("jobs must be at least 1")
 
     # Prepare the URL.
-    api_url = "https://src.fedoraproject.org/api/0/projects"
     base_params = {
         "username": user,
         "short": "true",
@@ -140,7 +147,7 @@ def fetch_packages(user: str, jobs: int = 1) -> list[str]:
     # Fetch the data for `page`.
     def fetch_page(page: int):
         params = {**base_params, "page": page}
-        url = f"{api_url}?{urlencode(params)}"
+        url = f"{API_PROJECTS}?{urlencode(params)}"
         return fetch_json(url)
 
     # The first request tells us how many pages exist.
@@ -175,9 +182,7 @@ def fetch_versions(package: str) -> FedoraReleases:
     # }, ...}
     # and will be formatted into `{'Fedora 45': [('pending', None), ...]}`
 
-    api_url = "https://packager-dashboard.fedoraproject.org/" \
-              "api/v1/package_versions/{}"
-    url = api_url.format(quote(package, safe=""))
+    url = API_DASHBOARD.format(quote(package, safe=""))
     data = fetch_json(url)
 
     # Save all releases with a version for this package.
