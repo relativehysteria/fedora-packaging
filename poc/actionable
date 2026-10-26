@@ -1,0 +1,97 @@
+
+#!/bin/sh
+
+set -eu
+
+# All of this is essentially just a wrapper around this:
+# ```
+# curl -fsSL \
+#     "https://src.fedoraproject.org/api/0/user/rruzicka/requests/actionable" \
+#     | jq -r '.requests[] | [.project.name, .title, .full_url] | join("|")' \
+#     | column -t -s '|'
+# ```
+
+API_BASE="https://src.fedoraproject.org/api/0"
+
+# Print an error message to stderr and exit.
+error() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+# Convert a Unix timestamp into the requested date format.
+format_timestamp() {
+    case "$(uname -s)" in
+        Darwin) date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null ;;
+        Linux) date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null ;;
+        *) error "unsupported operating system: $(uname -s)" ;;
+    esac
+}
+
+main() {
+    # Parse the arguments.
+    if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+        error "Usage: $0 USERNAME"
+    fi
+    user=$1
+
+    # Encode the username for use in the URL.
+    encoded_user=$(printf '%s' "$user" | jq -sRr '@uri') ||
+        error "could not encode username."
+
+    # Fetch actionable PRs. curl -f fails on HTTP error responses.
+    url="$API_BASE/user/$encoded_user/requests/actionable"
+    response=$(curl --fail --silent --show-error "$url") ||
+        error "could not fetch actionable PRs."
+
+    # Validate the API response.
+    printf '%s' "$response" | jq -e '
+        type == "object" and
+        (.requests | type == "array")
+    ' >/dev/null 2>&1 ||
+        error "invalid JSON or unexpected API response."
+
+    # Extract the PR fields.
+    pr_data=$(printf '%s' "$response" | jq -r '
+        .requests[] |
+        [
+            .project.name,
+            (.date_created // ""),
+            (.title // ""),
+            (.full_url // "")
+        ] |
+        map(tostring) |
+        join("|")
+    ') || error "could not parse actionable PRs."
+
+    # Format the creation timestamps.
+    formatted_data=$(
+        printf '%s\n' "$pr_data" |
+        while IFS='|' read -r name timestamp title url; do
+            [ -n "$name$timestamp$title$url" ] || continue
+
+            formatted_date=$(format_timestamp "$timestamp") ||
+                error "could not format a PR creation date."
+
+            printf '%s|%s|%s|%s\n' \
+                "$name" "$formatted_date" "$title" "$url"
+        done
+    ) || error "could not format PR data."
+
+    # Print the results.
+    if [ -z "$formatted_data" ]; then
+        printf 'No actionable PRs found for %s.\n' "$user"
+        return 0
+    fi
+
+    formatted_table=$(
+        {
+            printf '%s\n' "NAME|DATE CREATED|TITLE|URL"
+            printf '%s\n' "$formatted_data"
+        } | column -t -s '|'
+    ) || error "could not format the output table."
+
+    printf '%s\n' "$formatted_table"
+}
+
+main "$@"
