@@ -243,24 +243,18 @@ def split_nvr(package: str, nvr: str) -> tuple[str, str]:
     nvr = "buildah-1.43.4-1.fc43"
     return ("1.43.4", "1.fc43")
     ```
+
+    See rpm-version(7) for more about valid NVRs in RPM.
     """
     # Make sure we have the correct NVR for the correct package.
     prefix = f"{package}-"
     if not nvr.startswith(prefix):
         raise ValueError(f"build NVR does not start with {prefix!r}")
 
-    # The final hyphen and a digit start the RPM release suffix.
-    RPM_RELEASE_RE = re.compile(r"-(?P<release>[0-9][A-Za-z0-9._+~^]*)\Z")
+    version, sep, rpm_release = nvr[len(prefix):].rpartition("-")
 
-    # Strip off the package prefix and split the rpm release part off.
-    remainder = nvr[len(prefix):]
-    match = RPM_RELEASE_RE.search(remainder)
-    if not match:
+    if not sep or not re.fullmatch(r"[0-9][A-Za-z0-9._+~^]*", rpm_release):
         raise ValueError("could not identify the RPM release suffix")
-
-    # Make sure the package has a version specified.
-    version = remainder[:match.start()]
-    rpm_release = match.group("release")
     if not version:
         raise ValueError("upstream version is empty")
 
