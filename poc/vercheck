@@ -420,12 +420,13 @@ def check_package_regressions(package: str) -> int:
     for regression in regressions:
         current = regression.current_build
         previous = regression.previous_build
+
+        cur  = Color.wrap(regression.current_branch, Color.RED, Color.BOLD)
+        prev = Color.wrap(regression.previous_branch, Color.GREEN, Color.BOLD)
         print(
             f"{Color.wrap(package, Color.BOLD)}\n"
-            f"  ├─> {Color.wrap(regression.previous_branch, Color.GREEN)} "
-            f"{previous.version} ({previous.state})\n"
-            f"  └─> {Color.wrap(regression.current_branch, Color.RED)} "
-            f"{current.version} ({current.state})",
+            f"  ├─> {prev} {previous.version} ({previous.state})\n"
+            f"  └─> {cur} {current.version} ({current.state})",
             file=sys.stderr,
         )
 
