@@ -1,110 +1,58 @@
+
 #!/bin/sh
 
-set -u
+set -eu
+
+# All of this is essentially just a wrapper around this:
+# ```
+# curl -fsSL \
+#     "https://src.fedoraproject.org/api/0/user/rruzicka/requests/actionable" \
+#     | jq -r '.requests[] | [.project.name, .title, .full_url] | join("|")' \
+#     | column -t -s '|'
+# ```
 
 API_BASE="https://src.fedoraproject.org/api/0"
 
-
-# Print an error message to stderr.
+# Print an error message to stderr and exit.
 error() {
     printf 'Error: %s\n' "$*" >&2
+    exit 1
 }
 
-
-# Check that all external commands used by the script are available.
-check_dependencies() {
-    for cmd in curl jq column date; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            error "required command '$cmd' was not found."
-            return 1
-        fi
-    done
-}
-
-
-# Read the username from the command line.
-parse_arguments() {
-    if [ "$#" -ne 1 ] || [ -z "$1" ]; then
-        error "Usage: $0 USERNAME"
-        return 2
-    fi
-
-    USER=$1
-}
-
-
-# URL-encode the username so it can safely occupy one URL path segment.
-encode_username() {
-    encoded_user=$(printf '%s' "$USER" | jq -sRr '@uri') || {
-        error "could not URL-encode username '$USER'."
-        return 1
-    }
-}
-
-
-# Fetch a URL and return its HTTP status and response body.
-# The body is stored in RESPONSE_BODY; the status in HTTP_STATUS.
-fetch_url() {
-    HTTP_STATUS=""
-    RESPONSE_BODY=""
-
-    response=$(curl --silent --show-error \
-        --write-out '\n%{http_code}' "$1") || {
-        error "request failed: $1"
-        return 1
-    }
-
-    HTTP_STATUS=${response##*'
-'}
-    RESPONSE_BODY=${response%'
-'*}
-
-    case "$HTTP_STATUS" in
-        200)
-            ;;
-        *)
-            error "HTTP $HTTP_STATUS returned by $1"
-            return 1
-            ;;
+# Convert a Unix timestamp into the requested date format.
+format_timestamp() {
+    case "$(uname -s)" in
+        Darwin) date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null ;;
+        Linux) date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null ;;
+        *) error "unsupported operating system: $(uname -s)" ;;
     esac
 }
 
-
-# Verify that the requested account exists.
-check_user_exists() {
-    user_url="$API_BASE/user/$encoded_user"
-
-    if ! fetch_url "$user_url"; then
-        if [ "$HTTP_STATUS" = 404 ]; then
-            error "user '$USER' does not exist."
-        fi
-        return 1
+main() {
+    # Parse the arguments.
+    if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+        error "Usage: $0 USERNAME"
     fi
+    user=$1
 
-    # Validate the response, not just the HTTP status.
-    if ! printf '%s' "$RESPONSE_BODY" | \
-            jq -e 'type == "object"' >/dev/null 2>&1; then
-        error "invalid JSON response while looking up user '$USER'."
-        return 1
-    fi
-}
+    # Encode the username for use in the URL.
+    encoded_user=$(printf '%s' "$user" | jq -sRr '@uri') ||
+        error "could not encode username."
 
+    # Fetch actionable PRs. curl -f fails on HTTP error responses.
+    url="$API_BASE/user/$encoded_user/requests/actionable"
+    response=$(curl --fail --silent --show-error "$url") ||
+        error "could not fetch actionable PRs."
 
-# Fetch and validate the user's actionable pull requests.
-fetch_actionable_prs() {
-    prs_url="$API_BASE/user/$encoded_user/requests/actionable"
-
-    fetch_url "$prs_url" || return 1
-
-    if ! printf '%s' "$RESPONSE_BODY" | jq -e '
+    # Validate the API response.
+    printf '%s' "$response" | jq -e '
         type == "object" and
         (.requests | type == "array")
-    ' >/dev/null 2>&1; then
-        error "invalid JSON or unexpected response from the PR endpoint."
-        return 1
-    fi
+    ' >/dev/null 2>&1 ||
+        error "invalid JSON or unexpected API response."
 
-    PR_DATA=$(printf '%s' "$RESPONSE_BODY" | jq -r '
+    # Extract the PR fields.
+    pr_data=$(printf '%s' "$response" | jq -r '
         .requests[] |
         [
             .project.name,
@@ -114,75 +62,36 @@ fetch_actionable_prs() {
         ] |
         map(tostring) |
         join("|")
-    ') || {
-        error "could not parse actionable PRs for '$USER'."
-        return 1
-    }
-}
+    ') || error "could not parse actionable PRs."
 
-
-# Convert a Unix timestamp into the requested date format.
-format_timestamp() {
-    case "$(uname -s)" in
-        Darwin)
-            date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null
-            ;;
-        Linux)
-            date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null
-            ;;
-        *)
-            error "unsupported operating system: $(uname -s)"
-            return 1
-            ;;
-    esac
-}
-
-
-# Format the creation timestamp in every PR row.
-format_pr_data() {
-    FORMATTED_DATA=$(
-        printf '%s\n' "$PR_DATA" |
+    # Format the creation timestamps.
+    formatted_data=$(
+        printf '%s\n' "$pr_data" |
         while IFS='|' read -r name timestamp title url; do
-            # Skip empty rows.
             [ -n "$name$timestamp$title$url" ] || continue
 
-            formatted_date=$(format_timestamp "$timestamp") || {
-                error "invalid Unix timestamp '$timestamp'."
-                exit 1
-            }
+            formatted_date=$(format_timestamp "$timestamp") ||
+                error "could not format a PR creation date."
 
             printf '%s|%s|%s|%s\n' \
                 "$name" "$formatted_date" "$title" "$url"
         done
-    ) || {
-        error "could not format PR data."
-        return 1
-    }
-}
+    ) || error "could not format PR data."
 
-
-# Print the table, or explain why there is nothing to display.
-print_results() {
-    if [ -z "$FORMATTED_DATA" ]; then
-        printf 'No actionable PRs found for %s.\n' "$USER"
+    # Print the results.
+    if [ -z "$formatted_data" ]; then
+        printf 'No actionable PRs found for %s.\n' "$user"
         return 0
     fi
 
-    {
-        printf '%s\n' "NAME|DATE CREATED|TITLE|URL"
-        printf '%s\n' "$FORMATTED_DATA"
-    } | column -t -s '|'
-}
+    formatted_table=$(
+        {
+            printf '%s\n' "NAME|DATE CREATED|TITLE|URL"
+            printf '%s\n' "$formatted_data"
+        } | column -t -s '|'
+    ) || error "could not format the output table."
 
-
-main() {
-    parse_arguments "$@" || return $?
-    check_dependencies || return 2
-    encode_username || return 1
-    check_user_exists || return 1
-    fetch_actionable_prs || return 1
-    format_pr_data || return 1
-    print_results
+    printf '%s\n' "$formatted_table"
 }
 
 main "$@"
