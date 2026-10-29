@@ -1,0 +1,509 @@
+#!/usr/bin/env python
+
+"""Check whether package versions stay nondecreasing across Fedora/EPEL
+releases.
+
+The Packager Dashboard reports one build for each update state (pending, stable,
+testing). For each release, this checker picks the highest parseable upstream
+version, then compares releases from oldest to newest within each release
+family.
+"""
+
+import argparse
+import json
+import re
+import sys
+from typing import TypeAlias
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+
+
+# CONFIG GLOBALS ───────────────────────────────────────────────────────────────
+
+# How many parallel _networking_ jobs will be running at the same time. More
+# jobs send more requests.
+N_JOBS=10
+
+# How long to wait for the HTTP endpoint before giving up.
+HTTP_TIMEOUT = 20
+
+# The user agent to use for all requests.
+USER_AGENT = "check-package-versions/3.0"
+
+# The API endpoint used for listing out tracking fedora projects.
+API_PROJECTS = "https://src.fedoraproject.org/api/0/projects"
+
+# The API endpoint used for listing out package versions across branches.
+# NOTE: Information retrieved from this endpoint is stale at times
+API_DASHBOARD = "https://packager-dashboard.fedoraproject.org/" \
+    "api/v1/package_versions/{}"
+
+
+# TYPE ALIASES AND DATA CLASSES ────────────────────────────────────────────────
+
+# Name of a fedora release, such as "Fedora 43", "Fedora Rawhide"
+FedoraBranch: TypeAlias = str
+
+# The state of a package build. Will be "pending", "testing" or "stable".
+BuildState: TypeAlias = str
+
+# A pair of where a package was released and the package's version, e.g.
+# `("stable", "podman-1.6.3.fc46")`, `("testing", "buildah-1.6.4.fc45)`.
+ReleaseBuild: TypeAlias = tuple[BuildState, str]
+
+# All of the releases for a package.
+FedoraReleases: TypeAlias = dict[FedoraBranch, list[ReleaseBuild]]
+
+
+@dataclass(frozen=True)
+class ParsedBuild:
+    """A build whose upstream version could be compared reliably."""
+    branch: FedoraBranch
+    state: BuildState
+    nvr: str
+    version: str
+    version_key: VersionKey
+
+
+@dataclass(frozen=True, order=True)
+class VersionKey:
+    """Comparable version components, with final releases after prereleases."""
+    major: int
+    minor: int
+    patch: int
+    is_final: bool
+    # The tag sorts numeric identifiers before textual identifiers.
+    prerelease: tuple[VersionIdentifier, ...] = ()
+
+
+@dataclass(frozen=True)
+class Regression:
+    """A release whose version is below an earlier release's high-water mark."""
+    current_branch: FedoraBranch
+    current_build: ParsedBuild
+    previous_branch: FedoraBranch
+    previous_build: ParsedBuild
+
+
+# ANSI codes used for colorful terminal output.
+class Color:
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+    @classmethod
+    def wrap(cls, text: str, *styles: str) -> str:
+        """Wrap text in ANSI styles."""
+        return f"{''.join(styles)}{text}{cls.RESET}"
+
+# FUNCTIONS ────────────────────────────────────────────────────────────────────
+
+def fetch_json(url: str, timeout: int = HTTP_TIMEOUT) -> json.JSON:
+    """Fetch data from `url` and parse it as json."""
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.load(response)
+
+    if not isinstance(payload, dict):
+        raise ValueError("API response is not a JSON object")
+
+    return payload
+
+
+def fetch_packages(user: str, jobs: int = 1) -> list[str]:
+    """Fetch all package repositories the user has commit access to.
+
+    Fetch the first page to discover pagination, then fetch the remaining
+    pages concurrently, with at most `jobs` requests in flight.
+    """
+    # Validate the number of jobs.
+    if jobs < 1:
+        raise ValueError("jobs must be at least 1")
+
+    # Prepare the URL.
+    base_params = {
+        "username": user,
+        "short": "true",
+        "fork": "false",
+        "per_page": 100,
+    }
+
+    # Fetch the data for `page`.
+    def fetch_page(page: int):
+        params = {**base_params, "page": page}
+        url = f"{API_PROJECTS}?{urlencode(params)}"
+        return fetch_json(url)
+
+    # The first request tells us how many pages exist.
+    first_page = fetch_page(1)
+    n_pages = first_page["pagination"]["pages"]
+
+    # Keep page 1, then fetch all remaining pages concurrently.
+    pages = [first_page]
+
+    if n_pages > 1:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            pages.extend(
+                executor.map(fetch_page, range(2, n_pages + 1))
+            )
+
+    return [
+        project["name"]
+        for page in pages
+        for project in page["projects"]
+    ]
+
+
+def fetch_versions(package: str) -> FedoraReleases:
+    """Fetch package versions and discard rows with no pending/stable/testing
+    build.
+    """
+    # Prepare the URL and fetch the data. The data looks like this:
+    # {'Fedora 45': {
+    #     'pending': None,
+    #     'stable': 'aardvark-dns-2.1.0-1.fc45',
+    #     'testing': None
+    # }, ...}
+    # and will be formatted into `{'Fedora 45': [('pending', None), ...]}`
+
+    url = API_DASHBOARD.format(quote(package, safe=""))
+    data = fetch_json(url)
+
+    # Save all releases with a version for this package.
+    active = {
+        release: [
+            (branch, version)
+            for branch, version in states.items()
+            if version is not None
+        ]
+        for release, states in data.items()
+        if any(version is not None for version in states.values())
+    }
+    return active
+
+
+def version_key(version: str) -> VersionKey:
+    """Parse a supported version into a key that follows SemVer precedence."""
+    VERSION_RE = re.compile(
+        r"^(?:(?P<series>v(?P<series_major>[0-9]+))-)?v?"
+        r"(?P<major>[0-9]+)\.(?P<minor>[0-9]+)"
+        r"(?:\.(?P<patch>[0-9]+))?"
+        r"(?:[-~](?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+        r"(?:\+(?P<metadata>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+    )
+    match = VERSION_RE.fullmatch(version)
+    if not match:
+        raise ValueError("unsupported version format")
+
+    major = int(match["major"])
+    minor = int(match["minor"])
+    patch = int(match["patch"] or 0)
+
+    # The optional vN- prefix must agree with the SemVer major.
+    series_major = match.group("series_major")
+    if series_major is not None and int(series_major) != major:
+        raise ValueError(
+            f"v{series_major}- prefix disagrees with version major {major}"
+        )
+
+    # If there's no prerelase, we got our key.
+    prerelease = match.group("prerelease")
+    if prerelease is None:
+        return VersionKey(major, minor, patch, is_final=True)
+
+    # Parse dot-separated prerelease identifiers. SemVer dictates that
+    # numeric identifiers have lower precedence than non-numeric ones.
+    # We use a type flag (0 for digits, 1 for strings) to enforce this
+    # sort order (e.g., 1.0.0-1 sorts before 1.0.0-alpha).
+    identifiers: list[VersionIdentifier] = []
+    for identifier in prerelease.split("."):
+        if identifier.isdigit():
+            identifiers.append((0, int(identifier)))
+        else:
+            identifiers.append((1, identifier))
+    return VersionKey(
+        major, minor, patch, is_final=False, prerelease=tuple(identifiers)
+    )
+
+
+def split_nvr(package: str, nvr: str) -> tuple[str, str]:
+    """Split an NVR into upstream version and RPM release, such that:
+    ```
+    nvr = "buildah-1.43.4-1.fc43"
+    return ("1.43.4", "1.fc43")
+    ```
+
+    See rpm-version(7) for more about valid NVRs in RPM.
+    """
+    # Make sure we have the correct NVR for the correct package.
+    prefix = f"{package}-"
+    if not nvr.startswith(prefix):
+        raise ValueError(f"build NVR does not start with {prefix!r}")
+
+    version, sep, rpm_release = nvr[len(prefix):].rpartition("-")
+
+    if not sep or not re.fullmatch(r"[0-9][A-Za-z0-9._+~^]*", rpm_release):
+        raise ValueError("could not identify the RPM release suffix")
+    if not version:
+        raise ValueError("upstream version is empty")
+
+    return version, rpm_release
+
+
+def choose_build(
+    package: str,
+    branch: FedoraBranch,
+    builds: list[ReleaseBuild],
+) -> ParsedBuild | None:
+    """Choose the highest parseable build for one release."""
+    candidates: list[ParsedBuild] = []
+
+    # Go through all NVRs and save candidates for the highest version.
+    for (state, nvr) in builds:
+        if nvr is None:
+            continue
+
+        try:
+            # Get the version of the package and ignore the rpm release.
+            upstream_version, _rpm_release = split_nvr(package, nvr)
+            key = version_key(upstream_version)
+        except ValueError as error:
+            print(
+                f"{branch} ({state}: {nvr!r}): {error}; ignoring this build",
+                file=sys.stderr,
+            )
+            continue
+
+        candidates.append(
+            ParsedBuild(branch, state, nvr, upstream_version, key))
+
+    # Return the best candidate.
+    if candidates:
+        return max(candidates, key=lambda build: build.version_key)
+
+
+# Used in `rawhide_number()` for memoization.
+RAWHIDE_NUMBER = None
+def rawhide_number(releases: FedoraReleases) -> int:
+    """Infer Rawhide's Fedora number from build suffixes or numbered releases,
+    falling back to max Fedora release + 1."""
+    # We will only look up the rawhide number once and then save it for all
+    # packages.
+    global RAWHIDE_NUMBER
+
+    if RAWHIDE_NUMBER:
+        return RAWHIDE_NUMBER
+
+    # We haven't inferred the number yet.
+    rawhide = releases.get("Fedora Rawhide", [])
+
+    # Save all of the package versions that end with .fcXX
+    candidates: list[int] = []
+    for (branch, version) in rawhide:
+        match = re.search(r"\.fc(\d+)\Z", version)
+        if match:
+            candidates.append(int(match.group(1)))
+
+    # If we got candidates, use them!
+    if candidates:
+        RAWHIDE_NUMBER = max(candidates)
+        return RAWHIDE_NUMBER
+
+    # No candidates, fall back to the largest Fedora release + 1.
+    numbered = [
+        int(match.group(1))
+        for release in releases
+        if (match := re.fullmatch(r"Fedora (\d+)", release))
+    ]
+    RAWHIDE_NUMBER = max(numbered, default=0) + 1
+    return RAWHIDE_NUMBER
+
+
+def find_regressions(builds: list[ParsedBuild]) -> list[Regression]:
+    """Find version regressions within each already-sorted release stream."""
+    # Group up builds by release stream branches like this:
+    # streams = {
+    #     "Fedora": [ Build("Fedora 43", "2.0"), ... ],
+    #     "EPEL": [ Build("EPEL 9", "1.0"), ... ],
+    # }
+    branches: dict[FedoraBranch, list[ParsedBuild]] = {}
+    for build in builds:
+        branch = build.branch
+        if re.fullmatch(r"Fedora \d+", branch) or branch == "Fedora Rawhide":
+            branch = "Fedora"
+        if re.fullmatch(r"EPEL \d+", branch):
+            branch = "EPEL"
+        branches.setdefault(branch, []).append(build)
+
+    # Now go through all branches and check for regressions!
+    regressions: list[Regression] = []
+
+    for branch in branches.values():
+        # Save the highest version encountered.
+        highest: ParsedBuild | None = None
+
+        for current in branch:
+            # Regression if this version is older than the highest one yet.
+            if highest is not None and \
+                    current.version_key < highest.version_key:
+                regressions.append(Regression(
+                    current.branch, current, highest.branch, highest))
+            # No regression, we found the highest current version.
+            elif highest is None or current.version_key > highest.version_key:
+                highest = current
+
+    return regressions
+
+
+def check_package_regressions(package: str) -> list[Regression]:
+    """Return a sorted list of regressions for `package`."""
+    # Fetch all versions for this package.
+    try:
+        versions = fetch_versions(package)
+    except Exception as e:
+        print(f"ERROR: could not fetch package versions: {error}",
+              file=sys.stderr)
+        return []
+
+    if not versions:
+        return []
+
+    # Get the numbered release for the current Rawhide.
+    rawhide_ver = rawhide_number(versions)
+
+    def release_sort_key(
+        release: str,
+        rawhide_version: int
+    ) -> tuple[int, int, int, str]:
+        """Sort Fedora releases first, then EPEL, then other releases."""
+        match = re.fullmatch(r"Fedora (\d+)", release)
+        if match:
+            return (0, int(match.group(1)), 0, "")
+
+        if release == "Fedora Rawhide":
+            return (0, rawhide_version, 1, "")
+
+        if release == "Fedora ELN":
+            return (0, rawhide_version, 2, "")
+
+        match = re.fullmatch(r"EPEL (\d+)", release)
+        if match:
+            return (1, int(match.group(1)), 0, "")
+
+        return (2, 0, 0, release.casefold())
+
+    # Sort the version releases such that older Fedora branches are first.
+    # * Regular Fedora releases first (ordered by version number ascending)
+    # * Then Rawhide
+    # * Then ELN ater rawhide for the given version cycle
+    # * Then EPEL
+    # * Then other stuff.
+    versions = sorted(
+        versions.items(),
+        key=lambda item: release_sort_key(item[0], rawhide_ver)
+    )
+
+    # Get a list of the highest versions for each branch; these will be used to
+    # look for regressions.
+    selected: list[ParsedBuild] = [
+        build
+        for branch, builds in versions
+        if (build := choose_build(package, branch, builds)) is not None
+    ]
+
+    # Look for regressions and return them!
+    return find_regressions(selected)
+
+
+def check_regressions(packages: list[str], tree: bool = True) -> int:
+    """
+    Check regressions across all `packages` and return 1 if regressions exist.
+
+    If `tree`, the regression tree will be printed out instead of the summary.
+    """
+    # Get the regression list.
+    with ThreadPoolExecutor(max_workers=N_JOBS) as executor:
+        results = list(executor.map(check_package_regressions, packages))
+
+    # Only keep packages with regressions.
+    results = [
+        (package, regressions)
+        for package, regressions in zip(packages, results)
+        if regressions
+    ]
+
+    # Print the regression tree.
+    if tree:
+        for package, regressions in results:
+            for regression in regressions:
+                previous = regression.previous_build
+                current = regression.current_build
+
+                prev = Color.wrap(
+                    regression.previous_branch, Color.GREEN, Color.BOLD)
+                cur = Color.wrap(
+                    regression.current_branch, Color.RED, Color.BOLD)
+
+                print(
+                    f"{Color.wrap(package, Color.BOLD)}\n"
+                    f"  ├─> {prev} {previous.version} ({previous.state})\n"
+                    f"  └─> {cur} {current.version} ({current.state})",
+                    file=sys.stderr,
+                )
+
+    # Print the summary.
+    else:
+        if not any(results):
+            print("No updates required.")
+        else:
+            print("Need update:")
+            for package, regressions in results:
+                branches = ', '.join([i.previous_branch for i in regressions])
+                print(f"  {Color.wrap(package, Color.BOLD)} ({branches})")
+
+    # Keep warnings actionable in CI without mixing the report into stdout.
+    return int(len(packages) > 0)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse arguments given to the program."""
+    # Parse the args.
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("user", help="user whose projects will be checked")
+    parser.add_argument("--ignore", help="packages which should be ignored")
+    parser.add_argument(
+        "--tree",
+        help="print the whole regression tree instead of just the summary",
+        action="store_true"
+    )
+    args = parser.parse_args()
+
+    # Parse ignored packages; split them into a list.
+    if isinstance(args.ignore, str):
+        packs = [pack.strip() for pack in args.ignore.split(',')]
+        args.ignore = packs
+    else:
+        args.ignore = []
+
+    return args
+
+
+def main() -> int:
+    # Parse the arguments!
+    args = parse_args()
+
+    # Fetch the packages and removed ignored ones.
+    packages = [
+        i for i in fetch_packages(args.user)
+        if i not in args.ignore
+    ]
+
+    # Check for regressions.
+    return check_regressions(packages, tree=args.tree)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
