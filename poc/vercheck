@@ -359,18 +359,18 @@ def find_regressions(builds: list[ParsedBuild]) -> list[Regression]:
     return regressions
 
 
-def check_package_regressions(package: str) -> int:
-    """Check one package and return 1 when regressions exist or 2 if the version
-    data couldn't be fetched."""
+def check_package_regressions(package: str) -> list[Regression]:
+    """Return a sorted list of regressions for `package`."""
     # Fetch all versions for this package.
     try:
         versions = fetch_versions(package)
     except Exception as e:
         print(f"ERROR: could not fetch package versions: {error}",
               file=sys.stderr)
-        return 2
+        return []
+
     if not versions:
-        return
+        return []
 
     # Get the numbered release for the current Rawhide.
     rawhide_ver = rawhide_number(versions)
@@ -415,30 +415,58 @@ def check_package_regressions(package: str) -> int:
         if (build := choose_build(package, branch, builds)) is not None
     ]
 
-    # Look for regressions and print them out!
-    regressions = find_regressions(selected)
-    for regression in regressions:
-        current = regression.current_build
-        previous = regression.previous_build
+    # Look for regressions and return them!
+    return find_regressions(selected)
 
-        cur  = Color.wrap(regression.current_branch, Color.RED, Color.BOLD)
-        prev = Color.wrap(regression.previous_branch, Color.GREEN, Color.BOLD)
-        print(
-            f"{Color.wrap(package, Color.BOLD)}\n"
-            f"  ├─> {prev} {previous.version} ({previous.state})\n"
-            f"  └─> {cur} {current.version} ({current.state})",
-            file=sys.stderr,
-        )
+
+def check_regressions(packages: list[str], tree: bool = True) -> int:
+    """
+    Check regressions across all `packages` and return 1 if regressions exist.
+
+    If `tree`, the regression tree will be printed out instead of the summary.
+    """
+    # Get the regression list.
+    with ThreadPoolExecutor(max_workers=N_JOBS) as executor:
+        results = list(executor.map(check_package_regressions, packages))
+
+    # Only keep packages with regressions.
+    results = [
+        (package, regressions)
+        for package, regressions in zip(packages, results)
+        if regressions
+    ]
+
+    # Print the regression tree.
+    if tree:
+        for package, regressions in results:
+            for regression in regressions:
+                previous = regression.previous_build
+                current = regression.current_build
+
+                prev = Color.wrap(
+                    regression.previous_branch, Color.GREEN, Color.BOLD)
+                cur = Color.wrap(
+                    regression.current_branch, Color.RED, Color.BOLD)
+
+                print(
+                    f"{Color.wrap(package, Color.BOLD)}\n"
+                    f"  ├─> {prev} {previous.version} ({previous.state})\n"
+                    f"  └─> {cur} {current.version} ({current.state})",
+                    file=sys.stderr,
+                )
+
+    # Print the summary.
+    else:
+        if not any(results):
+            print("No updates required.")
+        else:
+            print("Need update:")
+            for package, regressions in results:
+                branches = ', '.join([i.previous_branch for i in regressions])
+                print(f"  {Color.wrap(package, Color.BOLD)} ({branches})")
 
     # Keep warnings actionable in CI without mixing the report into stdout.
-    return 1 if regressions else 0
-
-
-def check_regressions(packages: list[str]):
-    """Check regressions across all `packages`."""
-    with ThreadPoolExecutor(max_workers=N_JOBS) as executor:
-        returns = list(executor.map(check_package_regressions, packages))
-    return int(1 in returns)
+    return int(len(packages) > 0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -447,6 +475,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("user", help="user whose projects will be checked")
     parser.add_argument("--ignore", help="packages which should be ignored")
+    parser.add_argument(
+        "--tree",
+        help="print the whole regression tree instead of just the summary",
+        action="store_true"
+    )
     args = parser.parse_args()
 
     # Parse ignored packages; split them into a list.
@@ -470,7 +503,7 @@ def main() -> int:
     ]
 
     # Check for regressions.
-    return check_regressions(packages)
+    return check_regressions(packages, tree=args.tree)
 
 if __name__ == "__main__":
     raise SystemExit(main())
