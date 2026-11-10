@@ -5,8 +5,16 @@
 # * Figure out how to handle networking failures, including GitHub rate limits.
 # * Figure out what should be done in the case of [fedora-all] bugs when an
 #   update is released for a specific branch.
-# * Are there any weird things like bugs depending on bugs depending on bugs..?
 
+# Bugzilla lookup is best-effort:
+# - Infrastructure/API failures are fatal.
+# - Missing or ambiguous CVE-to-bug mappings are warnings.
+# - Valid mappings are included even if other CVEs cannot be resolved.
+#
+# The goal is to automate as much of the changelog generation as
+# possible without unnecessarily blocking an upstream release.
+
+import argparse
 import sys
 import re
 import subprocess
@@ -19,7 +27,7 @@ from urllib.request import Request, urlopen
 # The user agent to use for all requests.
 USER_AGENT = "podman-changelog-generator/1.0"
 
-# How long to wait for HTTP endpoints before giving up.
+# How long to wait for HTTP endpoints (in seconds) before giving up.
 HTTP_TIMEOUT = 20
 
 # The Red Hat bugzilla endpoint.
@@ -29,12 +37,24 @@ BUGZILLA_URL = "https://bugzilla.redhat.com"
 GITHUB_API = "https://api.github.com"
 
 
+class BugzillaLookupError(Exception):
+    """A Bugzilla issue could not be reliably associated with a CVE."""
+
+
+def eprint(*args, **kwargs):
+    """Wrapper around `print()` that uses stderr as its output."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+# TODO: Errors are not handled. Ok for POC; the final version MUST have a
+# somewhat robust networking error handler.
 def fetch(
     url: str,
     extra_headers: dict[str, str],
     timeout: int = HTTP_TIMEOUT,
     retries: int = 3,
 ) -> str:
+    """Fetches data from a remote `url`, implementing a timeout and retries."""
     retries = max(retries, 0)
 
     headers={ "User-Agent": USER_AGENT }
@@ -89,7 +109,20 @@ def extract_cves(release_notes: str) -> list[str]:
 
 def get_release_notes(git_org: str, git_repo: str, tag: str) -> str:
     """Fetch the release notes for `git_org/git_repo:tag` from GitHub."""
-    # NOTE: POC
+    # NOTE: POC; this is the ~actual 6.2.0 podman changelog
+    return """# Release Notes
+
+## 6.2.0
+### Security
+- Addresses CVE-2026-121885, untrusted image labels could be used to trick podman auto-update into restarting incorrect systemd units [GHSA-55rm-rwr7-q2wr](https://github.com/podman-container-tools/podman/security/advisories/GHSA-55rm-rwr7-q2wr).
+- Addresses CVE-2026-111361, malicious containers images could be able to bypass Digest and Signature validation [GHSA-pggw-qqjf-6cxw](https://github.com/podman-container-tools/container-libs/security/advisories/GHSA-pggw-qqjf-6cxw).
+- Addresses CVE-2026-123876, default seccomp profile socket deny rule could be bypass by a malicious container.
+
+### Features
+- The `podman push` command now supports a new option, `--platform`, which selects and pushes a single platform-specific manifest instead of the entire list.
+- The `podman kube play` command now supports a new option, `--validate`, which determines how unrecognized YAML fields are handled ([#18332](https://github.com/podman-container-tools/podman/issues/18332))."""
+
+    # NOTE: POC; this is just a sample changelog to show what doesn't get parsed
     return """### Security
 - Addresses [CVE-2025-11395](https://github.com/podman-container-tools/container-libs/security/advisories/GHSA-3gcv-x57j-xqxv), where importing images containing crafted layer tarballs with the podman load command, or importing volumes containing crafted symlinks with podman volume import, allows overwriting files on the host.
 * Addresses [CVE-2026-79699](https://github.com/podman-container-tools/container-libs/security/advisories/GHSA-mmq6-9mjh-hvq3), though we do not believe it is exploitable through the Podman command line.
@@ -103,24 +136,26 @@ def get_release_notes(git_org: str, git_repo: str, tag: str) -> str:
 - Updated Storage to v1.62.1
 - Addresses CVE-2025-12345 -- outside of the Security section, won't be parsed."""
 
-    url = "{GITHUB_API}/repos/{git_org}/{git_repo}/releases/tags/{tag}"
+    url = f"{GITHUB_API}/repos/{git_org}/{git_repo}/releases/tags/{tag}"
     headers = { "Accept": "application/vnd.github+json" }
     release_data = json.loads(fetch(url, headers))
     return release_data.get("body") or ""
 
 
-# XXX:
-# component: How the fuck do we extract the component for container-libs?
-# product: How about Fedora EPEL and other stuff?
+# XXX: product: How about Fedora EPEL and other stuff?
 def get_bugzilla_issues(
     cve: str,
     component: str,
-    product: str = "Fedora"
+    product: str = "Fedora",
 ) -> list[int]:
-    """Find the Fedora tracking bug(s) for a full CVE identifier `cve`.
+    """Find the Fedora tracking bug(s) for a full CVE identifier `cve` for
+    `component` (such as podman, buildah, containers-common).
 
     Returns the IDs of the parent issue(s) and the package-specific
     tracking issue.
+
+    NOTE: We intentionally only resolve direct parent relationships.
+    More complicated Bugzilla dependency trees are not traversed.
     """
     if not re.fullmatch(r"CVE-\d{4}-\d+", cve):
         raise ValueError(f"Invalid CVE identifier: {cve}")
@@ -171,9 +206,8 @@ def get_bugzilla_issues(
     ]
 
     if not matches:
-        raise RuntimeError(
-            f"No {product}/{component} tracking bug found for {cve}. "
-            "Check Bugzilla visibility and search filters."
+        raise BugzillaLookupError(
+            f"No {product}/{component} tracking bug found for {cve}."
         )
 
     if len(matches) > 1:
@@ -181,9 +215,8 @@ def get_bugzilla_issues(
             f"#{bug.get('id')}: {bug.get('summary')}"
             for bug in matches
         )
-        raise RuntimeError(
-            f"Multiple {componentt} tracking bugs "
-            f"found for {cve}: {details}"
+        raise BugzillaLookupError(
+            f"Multiple {component} tracking bugs found for {cve}: {details}"
         )
 
     tracker = matches[0]
@@ -202,58 +235,114 @@ def get_bugzilla_issues(
     return list(dict.fromkeys(parent_ids + [tracker_id]))
 
 
-def main():
-    # NOTE: POC
-    upstream_tag = "v5.8.7"
-    # # Get the env vars
-    # upstream_tag = getenv("PACKIT_PROJECT_UPSTREAM_TAG")
-    # if not upstream_tag:
-    #     raise ValueError("PACKIT_PROJECT_UPSTREAM_TAG not in env")
+def parse_env_and_args() -> argparse.Namespace:
+    """Parses and validates the required env vars and program arguments."""
+    # We require some Packit set env vars. Format of the dictionary here is:
+    # { ENV_VAR: (argparse_namespace_variable, description) }
+    required_env = {
+        "PACKIT_PROJECT_VERSION": (
+            "upstream_version",
+            "Version that will be set in the RPM spec file.",
+        ),
+        "PACKIT_PROJECT_UPSTREAM_TAG": (
+            "upstream_tag",
+            "Upstream Git tag corresponding to the release.",
+        ),
+    }
 
-    # Parse the git organization (e.g. podman-container-tools) and the repo
-    result = subprocess.run(
-        ["git", "remote", "get-url", "origin"],
-        capture_output=True,
-        text=True,
-        check=True,
+    env_info = "Required environment variables (provided by Packit):\n"
+    env_info += "\n".join(
+        f"    {name}\n        {description}"
+        for name, (_, description) in required_env.items()
     )
-    git_origin = result.stdout.strip()
 
-    # NOTE: POC
-    git_origin = "https://github.com/podman-container-tools/podman.git"
+    description = "Generate RPM changelog entries from upstream release notes."
 
-    # We'll fetch the notes from the GitHub API.
-    if "github" not in git_origin:
-        raise ValueError(f"Not a GitHub upstream: f{git_origin}")
+    # Parse the arguments passed to the program.
+    parser = argparse.ArgumentParser(
+        description=description,
+        epilog=env_info,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
 
-    if "://" not in git_origin and ":" in git_origin:
-        path = git_origin.split(":", 1)[1]
-    else:
-        path = urlparse(git_origin).path
+    parser.add_argument("--git-org", required=True,
+        help="Upstream Git organization (e.g. podman-container-tools).")
+    parser.add_argument("--git-repo", required=True,
+        help="Upstream Git repository (e.g. podman).")
+    parser.add_argument("--bugzilla-component",
+        help="Bugzilla component to search for tracking bugs "
+             "(default: same as git-repo).")
 
-    parts = path.strip("/").removesuffix(".git").split("/")
+    # NOTE: I'm not quite sure we wanna filter by a specific product instead of
+    # trying to do a catch-all or whatever.
+    parser.add_argument("--bugzilla-product", default="Fedora",
+        help="Bugzilla product to search for tracking bugs "
+             "(default: Fedora).")
 
-    if len(parts) < 2:
-        raise ValueError(f"Invalid Git remote URL: {git_origin}")
+    args = parser.parse_args()
 
-    git_org, git_repo = parts[:2]
+    # By default, the bugzilla component is the same as the repo.
+    if args.bugzilla_component is None:
+        args.bugzilla_component = args.git_repo
 
-    # Fetch the release notes for this release and parse out the CVEs.
-    release_notes = get_release_notes(git_org, git_repo, upstream_tag)
-    cves = extract_cves(release_notes)
+    # Error out on missing env vars.
+    missing = [name for name in required_env if not getenv(name)]
 
-    changelog_lines = []
-    for cve in cves:
-        # NOTE: POC, "podman" could also be buildah, containers-common, etc.
-        bug_ids = get_bugzilla_issues(cve, "podman")
-
-        changelog_lines.append(
-            f"{cve}: "
-            + ", ".join(f"fixes rhbz#{bug_id}" for bug_id in bug_ids),
+    if missing:
+        parser.error(
+            "Missing required environment variables:\n"
+            + "\n".join(f"  - {name}" for name in missing)
         )
 
-    version = upstream_tag.lstrip('v')
-    print(f"- Update to {version} upstream release")
+    # Parse the env vars and save them to the parser namespace.
+    for env_var, (attr, _) in required_env.items():
+        setattr(args, attr, getenv(env_var))
+
+    return args
+
+
+def main():
+    args = parse_env_and_args()
+
+    # Fetch the release notes for this release and parse out the CVEs.
+    release_notes = get_release_notes(
+        args.git_org, args.git_repo, args.upstream_tag)
+    cves = extract_cves(release_notes)
+
+    # Fetch the issues for each CVE and generate a changelog line for them.
+    changelog_lines = []
+    warnings = []
+    for cve in cves:
+        try:
+            bug_ids = get_bugzilla_issues(
+                cve, args.bugzilla_component, args.bugzilla_product)
+        except BugzillaLookupError as e:
+            warnings.append(f"{cve}: {e}")
+            continue
+
+        fixes  = ", ".join(f"fixes rhbz#{bug_id}" for bug_id in bug_ids)
+        changelog_lines.append(f"{cve}: {fixes}")
+
+    # Print out the warnings for maintainers without aborting the whole update
+    # process.
+    # TODO: Verify that these warnings do actually show up somewhere. :D Though
+    # it would be better if the maintainers were pinged instead of having to
+    # check the upstream Packit output.
+    if warnings:
+        eprint("\nWARNING: Some CVEs could not be automatically associated "
+               "with Fedora Bugzilla issues.")
+        eprint("The downstream update will proceed without these CVE "
+              "references.")
+        eprint("Please inspect the following CVEs manually:")
+
+        for warning in warnings:
+            eprint(f"  - {warning}")
+
+        eprint("\nPlease verify the corresponding Bugzilla issues before "
+              "submitting the update.\n")
+
+    eprint("Generated RPM changelog:")
+    print(f"- Update to {args.upstream_version} upstream release")
     for line in changelog_lines:
         print(f"- Addresses {line}")
 
